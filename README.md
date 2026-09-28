@@ -61,15 +61,13 @@ The balancer answers these itself:
 
 | Endpoint | Behaviour |
 |---|---|
-| `GET /` | Service banner and the list of proxied endpoints |
+| `GET /` | Service banner and the list of API routes it serves (not the configured backends) |
 | `GET /health` | Liveness — `ok` whenever the process is alive, even with every backend down. Used by the container `HEALTHCHECK` |
 | `GET /ready` | Readiness — `503` while no backend reports metrics, so a balancer with nothing to serve is taken out of rotation |
 | `GET /metrics` | The balancer's **own** Prometheus counters (no longer relayed upstream) |
 | `GET /v1/models` | Live aggregate of `/v1/models` from all backends; `503` if none answers |
 
-Every other path and method is forwarded. `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (incl. `/{id}` and `/{id}/cancel`), tool calling, and streaming (SSE) therefore work unchanged; transient `500/502/503/504` responses fall back to another endpoint of the same group.
-
-`/health`, `/ready` and `/metrics` are the balancer's own and are never proxied; `/v1/models` aggregates the backends live.
+Every other path and method is forwarded. `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (incl. `/{id}` and `/{id}/cancel`), tool calling, and streaming (SSE) therefore work unchanged; transient `500/502/503/504` responses fall back to another endpoint of the same group. `/v1/models` is served here rather than forwarded, but aggregates the backends live.
 
 ## Retry behavior
 
@@ -102,7 +100,7 @@ Configuration comes from two sources. **Environment variables provide the defaul
 | `VLLM_2_URL` | `http://vllm2:8000` | Default endpoint 2 (ditto) |
 | `POLL_INTERVAL` | `2.0` | Seconds between `/metrics` poll cycles |
 | `TIMEOUT` | `300.0` | Upstream timeout in seconds (total for regular requests; idle/`sock_read` for streamed responses, so a slow but active stream is not cut off) |
-| `LISTEN_PORT` | `8000` | Port the balancer listens on (startup only) |
+| `LISTEN_PORT` | `8000` | Port the balancer listens on. Hot-reloadable: the new port is bound before the old one is closed |
 | `QUEUE_TIME_WEIGHT` | `1.0` | Weight of the queue-time term in the score |
 | `MAX_RETRIES` | `2` | Retries after the first attempt on transient errors |
 | `RETRY_BACKOFF` | `0.2` | Delay between retries, in seconds |
@@ -119,7 +117,7 @@ Configuration comes from two sources. **Environment variables provide the defaul
 
 ### `einstellung.json` — the settings
 
-Keys mirror the environment variables above, in lower case:
+Keys mirror the environment variables above, in lower case. The file is read as an excerpt — every key is optional, and a key that is absent keeps its current value:
 
 ```json
 {
@@ -129,7 +127,10 @@ Keys mirror the environment variables above, in lower case:
   "max_retries": 2,
   "retry_backoff": 0.2,
   "overload_threshold": 10,
-  "kv_cache_overload_threshold": 0.95
+  "kv_cache_overload_threshold": 0.95,
+  "max_body_size": 67108864,
+  "listen_port": 8000,
+  "auth_token": ""
 }
 ```
 
@@ -147,9 +148,19 @@ Set `auth_token` (or `AUTH_TOKEN`) to require a token. Everything except the ope
 | Header | Meaning |
 |---|---|
 | `X-Auth-Token: <token>` | The balancer's own credential. **Stripped before forwarding**, so it never reaches a backend |
-| `Authorization: Bearer <token>` | Relayed to the backend unchanged — that is the backend's own credential slot (the OpenAI key) and doubles as balancer auth |
+| `Authorization: Bearer <token>` | Relayed to the backend unchanged — this is the backend's own credential slot (the OpenAI key) — and also accepted as the balancer's token |
 
 Tokens are compared with `hmac.compare_digest`, so a wrong token cannot be recovered character by character from response timing. `/`, `/health`, `/ready` and `/metrics` stay open: probes must keep working while the balancer is unhealthy, and none of them reveals backend data.
+
+> **Enabling `auth_token` breaks stock OpenAI clients.** They send only `Authorization: Bearer <backend key>`, and if that key differs from the balancer token the request is rejected with `401` before it ever reaches a backend. Clients therefore have to send **both** headers when the two tokens differ:
+>
+> ```bash
+> curl -H "X-Auth-Token: $LB_TOKEN" \
+>      -H "Authorization: Bearer $VLLM_KEY" \
+>      http://lb:8000/v1/chat/completions -d '{"model":"gpt-oss-120b"}'
+> ```
+>
+> If the balancer token and the backend key are the same value, a single `Authorization` header is enough.
 
 **Without a token the balancer is open**, and it says so in a warning at startup. Anything that can reach the port can use the backends, so put it behind your reverse proxy or configure a token.
 
@@ -180,7 +191,7 @@ The image pins `python:3.12-slim`, installs `ca-certificates` for HTTPS to backe
 ```bash
 uv sync
 uv run pytest -q                       # 122 tests
-uv run pytest -q --cov=loadbalancer    # coverage
+uv run pytest -q --cov=loadbalancer    # coverage (89 %)
 uv run ruff check .                    # lint
 uv run ruff format --check .           # format
 uv run mypy src tests scripts          # strict type check
@@ -206,14 +217,14 @@ Dockerfile           # container image (non-root, HEALTHCHECK)
 scripts/
 ├── mutants.py       # manual mutation testing
 └── smoke.py         # real-execution smoke test
-tests/               # unit, integration (real sockets), property tests
+tests/               # unit, integration (real sockets), property, auth, container
 ```
 
 ## Known limits
 
 - A broken stream is **reported, not repaired**. After bytes have reached the client there is no retry — a second attempt would splice a different answer onto a half-written body and pay for the inference twice. SSE clients get a terminal `event: error`; the bytes already sent stay incomplete, so the partial answer has to be discarded by the client.
 - `listen_port` is changed by re-binding the socket, which drops requests in flight on the old port. A config value the process cannot bind is refused (the old listener keeps serving), but a *successfully* bound wrong port still takes traffic away.
-- `X-Auth-Token` is stripped before forwarding, but `Authorization` is relayed — if the balancer token and the backend key are different, send the balancer token via `X-Auth-Token` only.
+- `X-Auth-Token` is stripped before forwarding, but `Authorization` is relayed. Stock OpenAI clients therefore get `401` once a token is configured unless they also send `X-Auth-Token` (see [Authentication](#authentication)).
 - Request bodies are buffered in memory to enforce `max_body_size` (64 MiB by default). There is no streaming upload path.
 - Readiness reflects "a backend reported metrics", not "a backend can serve this model"; a model whose endpoints are all unhealthy still yields `503` only once the model is requested.
 - The healthcheck probes liveness, so a balancer with every backend down stays `healthy` in Docker. Use `/ready` for load-balancer or orchestration readiness.
