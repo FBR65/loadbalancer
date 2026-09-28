@@ -2,17 +2,24 @@
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient
-
 from conftest import Fleet, read_leniently
+
+from vllm_lb.config import Config
 
 
 async def _half_streamed_then_dead(request: web.Request) -> web.StreamResponse:
-    """Writes one SSE chunk, then dies: the client already saw that chunk."""
+    """Writes one SSE chunk, then dies mid-body: the client already saw it.
+
+    A real backend that loses the process leaves a truncated chunked body, so
+    the connection is aborted instead of a second status line being written.
+    """
     response = web.StreamResponse(status=200, headers={"content-type": "text/event-stream"})
     await response.prepare(request)
     await response.write(b'data: {"tok": 1}\n\n')
-    response.force_close()
-    raise web.HTTPBadGateway()
+    transport = request.transport
+    assert transport is not None
+    transport.abort()
+    return response
 
 
 async def _marks_itself(request: web.Request) -> web.StreamResponse:
@@ -27,9 +34,7 @@ async def test_stream_failure_does_not_retry_onto_another_instance(fleet: Fleet)
     lb = await fleet.start_lb(["flaky", "healthy"], states=states)
 
     async with TestClient(lb) as client:
-        response = await client.post(
-            "/v1/chat/completions", json={"model": "m", "stream": True}
-        )
+        response = await client.post("/v1/chat/completions", json={"model": "m", "stream": True})
         body = await read_leniently(response)
 
     assert fleet.hits["flaky"] == ["/v1/chat/completions"], "flaky instance must be tried once"
@@ -44,9 +49,7 @@ async def test_truncated_stream_reaches_the_client_as_truncated(fleet: Fleet) ->
     lb = await fleet.start_lb(["flaky"], states=states)
 
     async with TestClient(lb) as client:
-        response = await client.post(
-            "/v1/chat/completions", json={"model": "m", "stream": True}
-        )
+        response = await client.post("/v1/chat/completions", json={"model": "m", "stream": True})
         body = await read_leniently(response)
 
     assert b"served_by" not in body
@@ -92,3 +95,28 @@ async def test_client_error_is_never_retried(fleet: Fleet) -> None:
 
     assert calls == ["/v1/chat/completions"]
     assert response.status == 400
+
+
+async def test_504_names_the_upstream_error(fleet: Fleet) -> None:
+    """An unreachable backend must not produce `upstream error: None`."""
+    dead = "http://127.0.0.1:1"
+    config = Config(vllm_urls=[dead], max_retries=0, retry_backoff=0.01, timeout=2)
+    states = {
+        dead: {
+            "running": 0.0,
+            "waiting": 0.0,
+            "queue_time_sum": 0.0,
+            "kv_cache_usage_perc": 0.1,
+            "preemptions": 0.0,
+            "sleeping": False,
+        }
+    }
+    lb = await fleet.start_lb([], config=config, states=states)
+
+    async with TestClient(lb) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "m"})
+        body = await response.text()
+
+    assert response.status == 504
+    assert "None" not in body
+    assert dead in body, f"the 504 must identify the failing instance: {body!r}"

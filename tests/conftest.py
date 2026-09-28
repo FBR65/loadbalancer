@@ -70,9 +70,7 @@ class Fleet:
         urls = [self._urls[n] for n in names]
         if states is None:
             states = {u: state() for u in urls}
-        cfg = config or Config(
-            vllm_urls=urls, max_retries=2, retry_backoff=0.01, timeout=5
-        )
+        cfg = config or Config(vllm_urls=urls, max_retries=2, retry_backoff=0.01, timeout=5)
         self.lb = TestServer(build_app(cfg, states, model_map))
         await self.lb.start_server()
         return self.lb

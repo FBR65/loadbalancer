@@ -2,7 +2,6 @@
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient
-
 from conftest import Fleet
 
 
@@ -22,9 +21,7 @@ async def test_query_string_is_forwarded(fleet: Fleet) -> None:
     lb = await fleet.start_lb(["a"], states=fleet.states(a={}))
 
     async with TestClient(lb) as client:
-        response = await client.post(
-            "/v1/chat/completions?trace=abc&user=7", json={"model": "m"}
-        )
+        response = await client.post("/v1/chat/completions?trace=abc&user=7", json={"model": "m"})
         echoed = await response.json()
 
     assert echoed["query"] == {"trace": "abc", "user": "7"}

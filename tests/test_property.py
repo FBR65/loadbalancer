@@ -5,8 +5,8 @@ from typing import Any
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient
-
 from conftest import Fleet
+
 from vllm_lb.balancer import pick
 from vllm_lb.proxy import preferred_candidates
 
@@ -48,6 +48,7 @@ async def test_no_request_header_ever_leaks_through_the_proxy(fleet: Fleet) -> N
     assert len(sets) >= 30
 
     for headers in sets:
+
         async def handler(request: web.Request, h: dict[str, str] = headers) -> web.StreamResponse:
             return web.Response(body=b"{}", headers=h | {"content-type": "application/json"})
 
@@ -67,7 +68,6 @@ async def test_no_request_header_ever_leaks_through_the_proxy(fleet: Fleet) -> N
         assert leaked == set(), f"leaked {sorted(leaked)} for upstream headers {headers}"
         assert response.headers.get("content-length") == "2", "wrong body length forwarded"
 
-        await fleet.lb.close()  # type: ignore[union-attr]
         fleet.lb = None
 
 
@@ -93,7 +93,7 @@ def test_candidate_selection_never_invents_or_drops_instances() -> None:
         healthy = {u for u, s in states.items() if s is not None}
         tried = rng.sample(names, rng.randint(0, len(names)))
 
-        result = preferred_candidates(states, tried)  # type: ignore[arg-type]
+        result = preferred_candidates(states, tried)
 
         assert set(result) <= healthy, "returned an unhealthy instance"
         assert bool(result) == bool(healthy), "empty result while instances are healthy"
@@ -104,11 +104,16 @@ def test_pick_only_returns_offered_candidates() -> None:
     for _ in range(2000):
         size = rng.randint(0, 6)
         states = {
-            f"u{i}": (None if rng.random() < 0.2 else
-                      {"running": rng.uniform(0, 5), "waiting": 0.0, "queue_time_sum": 0.0})
+            f"u{i}": (
+                None
+                if rng.random() < 0.2
+                else {"running": rng.uniform(0, 5), "waiting": 0.0, "queue_time_sum": 0.0}
+            )
             for i in range(size)
         }
-        chosen = pick(states, 1.0, rng=random.Random(rng.random()))  # type: ignore[arg-type]
+
+        chosen = pick(states, 1.0, rng=random.Random(rng.random()))
+
         if chosen is None:
             assert all(s is None for s in states.values())
         else:
