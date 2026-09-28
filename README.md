@@ -153,7 +153,7 @@ Environment variables (see `.env.example`):
 
 ```bash
 uv sync
-uv run python -m vllm_lb.main
+uv run python -m loadbalancer.main
 ```
 
 ### Docker
@@ -167,23 +167,41 @@ docker run -p 8000:8000 --env-file .env vllm-lb
 
 ```bash
 uv sync
-uv run pytest -q          # tests
-uv run ruff check .       # lint
-uv run ruff format --check .  # format
-uv run mypy src/          # type check
-uv run python scripts/real_execution.py  # smoke test with mock backends
+uv run pytest -q                    # tests (33)
+uv run pytest -q --cov=src/loadbalancer  # coverage
+uv run ruff check .                 # lint
+uv run ruff format --check .        # format
+uv run mypy src/ tests/             # strict type check
+uv run python scripts/mutants.py    # mutation testing (7 mutants, all must die)
+uv run python scripts/smoke.py      # boots the real console script against real backends
 ```
 
 ## Project layout
 
 ```
-src/vllm_lb/
+src/loadbalancer/
 ├── config.py        # environment configuration
 ├── metrics.py       # /metrics parser (Prometheus format)
 ├── balancer.py      # load score + instance selection
 ├── proxy.py         # async reverse proxy + streaming
+├── watchdog.py      # hot reload of einstellung.json / modelle.json
 └── main.py          # metrics polling + server startup
+scripts/
+├── mutants.py       # manual mutation testing
+└── smoke.py         # real-execution smoke test
 ```
+
+## Known limits
+
+- A response that breaks **after** the proxy already wrote bytes to the client
+  (mid-SSE disconnect) is never retried — the client keeps a truncated stream
+  rather than a second, spliced-in answer from another instance.
+- Repeated upstream headers (e.g. several `Set-Cookie`) collapse to the last
+  one when relayed; vLLM does not use them.
+- Hot reload applies to routing/scoring settings; `listen_port` and
+  `max_body_size` are read at startup and need a restart.
+- `GET /metrics` is proxied to a backend; the balancer exposes no metrics of
+  its own, and `GET /health` reports `ok` even when every backend is down.
 
 ## License
 

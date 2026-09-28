@@ -2,20 +2,22 @@
 
 import asyncio
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet, state
 
-from vllm_lb.config import Config
-from vllm_lb.proxy import PROXY_KEY
+from loadbalancer.config import Config
+from loadbalancer.proxy import PROXY_KEY
 
 
 async def _ok(request: web.Request) -> web.StreamResponse:
     return web.json_response({"ok": True})
 
 
-def _states(urls: list[str], **per: dict) -> dict:
+def _states(urls: list[str], per: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     return {u: state(**per.get(u, {})) for u in urls}
 
 
@@ -77,7 +79,7 @@ async def test_retry_skips_an_overloaded_instance(fleet: Fleet) -> None:
     await fleet.backend("b", _ok)
     states = _states(
         [fleet.url("a"), fleet.url("b")],
-        **{
+        {
             fleet.url("a"): {"queue_time_sum": 0.0},
             fleet.url("b"): {"queue_time_sum": 1.0, "waiting": 99},
         },
@@ -108,7 +110,8 @@ async def test_connection_error_is_retried_on_a_fresh_instance(fleet: Fleet) -> 
     good = fleet.url("good")
     dead = "http://127.0.0.1:1"  # nothing listens: connect fails immediately
     states = _states(
-        [dead, good], **{dead: {"queue_time_sum": 0.0}, good: {"queue_time_sum": 50.0}}
+        [dead, good],
+        {dead: {"queue_time_sum": 0.0}, good: {"queue_time_sum": 50.0}},
     )
     config = Config(vllm_urls=[dead, good], max_retries=2, retry_backoff=0.01, timeout=5)
     lb = await fleet.start_lb([], config=config, states=states)

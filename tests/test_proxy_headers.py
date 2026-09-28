@@ -6,7 +6,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet
 
-from vllm_lb.proxy import HOP_BY_HOP, _forwardable_headers
+from loadbalancer.proxy import HOP_BY_HOP, _forwardable_headers
 
 # `upgrade`/`proxy-*` change how aiohttp's own server answers, so they are
 # covered by the unit test below rather than end to end.

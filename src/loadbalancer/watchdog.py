@@ -1,4 +1,4 @@
-# src/vllm_lb/watchdog.py
+# src/loadbalancer/watchdog.py
 import logging
 from pathlib import Path
 
@@ -6,9 +6,9 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
 
-from vllm_lb.config import Config, reload_from_files
+from loadbalancer.config import Config, reload_from_files
 
-logger = logging.getLogger("vllm_lb.watchdog")
+logger = logging.getLogger("loadbalancer.watchdog")
 
 
 class _ConfigFileHandler(FileSystemEventHandler):

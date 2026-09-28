@@ -7,8 +7,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet
 
-from vllm_lb.balancer import pick
-from vllm_lb.proxy import preferred_candidates
+from loadbalancer.balancer import pick
+from loadbalancer.proxy import preferred_candidates
 
 SEED = 20260928
 HOP_BY_HOP = frozenset(

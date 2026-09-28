@@ -10,15 +10,11 @@ dependencies = [
 ]
 
 [project.scripts]
-loadbalancer = "vllm_lb.main:run"
+loadbalancer = "loadbalancer.main:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
-
-[tool.uv.build-backend]
-# the distribution is called `loadbalancer`, the import package `vllm_lb`
-module-name = "vllm_lb"
 
 [dependency-groups]
 dev = [

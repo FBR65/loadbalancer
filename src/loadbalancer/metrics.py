@@ -1,4 +1,4 @@
-# src/vllm_lb/metrics.py
+# src/loadbalancer/metrics.py
 import re
 from collections.abc import Callable
 from typing import Any, TypedDict, cast

@@ -4,7 +4,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet, read_leniently
 
-from vllm_lb.config import Config
+from loadbalancer.config import Config
 
 
 async def _half_streamed_then_dead(request: web.Request) -> web.StreamResponse:

@@ -6,8 +6,8 @@ from aiohttp import web
 from aiohttp.client import ClientResponse
 from aiohttp.test_utils import TestServer
 
-from vllm_lb.config import Config
-from vllm_lb.proxy import build_app
+from loadbalancer.config import Config
+from loadbalancer.proxy import build_app
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 

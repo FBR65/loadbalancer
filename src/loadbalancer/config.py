@@ -1,4 +1,4 @@
-# src/vllm_lb/config.py
+# src/loadbalancer/config.py
 import json
 import os
 import ssl

@@ -3,13 +3,13 @@
 import inspect
 from importlib.metadata import entry_points
 
-import vllm_lb
+import loadbalancer
 
 
 def test_package_exports_its_api() -> None:
-    assert "build_app" in vllm_lb.__all__
-    assert callable(vllm_lb.build_app)
-    assert "vllm-lb!" not in (vllm_lb.__doc__ or "")
+    assert "build_app" in loadbalancer.__all__
+    assert callable(loadbalancer.build_app)
+    assert "vllm-lb!" not in (loadbalancer.__doc__ or "")
 
 
 def test_console_script_resolves_to_a_callable() -> None:
@@ -31,5 +31,5 @@ def test_console_script_entry_point_is_synchronous() -> None:
 def test_importing_the_package_does_not_start_anything() -> None:
     import importlib
 
-    module = importlib.import_module("vllm_lb")
-    assert module is vllm_lb
+    module = importlib.import_module("loadbalancer")
+    assert module is loadbalancer

@@ -1,4 +1,4 @@
-# src/vllm_lb/main.py
+# src/loadbalancer/main.py
 import asyncio
 import json
 import logging
@@ -11,14 +11,14 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from vllm_lb.config import Config, load_config, load_dotenv, upstream_ssl_context
-from vllm_lb.metrics import MetricsResult, parse_metrics
-from vllm_lb.proxy import build_app
-from vllm_lb.watchdog import ConfigWatcher
+from loadbalancer.config import Config, load_config, load_dotenv, upstream_ssl_context
+from loadbalancer.metrics import MetricsResult, parse_metrics
+from loadbalancer.proxy import build_app
+from loadbalancer.watchdog import ConfigWatcher
 
 State = dict[str, dict[str, int | float | bool | None] | None]
 
-logger = logging.getLogger("vllm_lb")
+logger = logging.getLogger("loadbalancer")
 
 
 def metrics_urls(base: str) -> list[str]:

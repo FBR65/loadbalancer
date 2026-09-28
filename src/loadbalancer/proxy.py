@@ -1,4 +1,4 @@
-# src/vllm_lb/proxy.py
+# src/loadbalancer/proxy.py
 import asyncio
 import json
 import logging
@@ -8,10 +8,10 @@ from typing import cast
 import aiohttp
 from aiohttp import web
 
-from vllm_lb.balancer import pick
-from vllm_lb.config import Config, load_config, upstream_ssl_context
+from loadbalancer.balancer import pick
+from loadbalancer.config import Config, load_config, upstream_ssl_context
 
-logger = logging.getLogger("vllm_lb.proxy")
+logger = logging.getLogger("loadbalancer.proxy")
 
 State = dict[str, dict[str, int | float | bool | None] | None]
 

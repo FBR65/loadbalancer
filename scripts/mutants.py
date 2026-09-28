@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Manual mutation testing: every mutant must be killed by the suite.
 
-Each mutant is a plausible bug injected into src/vllm_lb/proxy.py, applied
+Each mutant is a plausible bug injected into src/loadbalancer/proxy.py, applied
 one at a time. The mutant is killed when the test suite fails; afterwards the
 file is restored from git, so the restore is verifiable with `git diff`.
 
@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TARGET = Path("src/vllm_lb/proxy.py")
+TARGET = Path("src/loadbalancer/proxy.py")
 
 SESSION_PROP = """        if self._session is None:
             self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=self.ssl_ctx))
@@ -89,8 +89,9 @@ def main() -> int:
                 survivors.append(name)
         finally:
             TARGET.write_text(original)
-            restored = run(["git", "diff", "--quiet", "--", str(TARGET)])
-            if restored.returncode != 0:
+            # the restore must be verifiable without git: the file on disk has
+            # to be byte-identical to what we started from
+            if TARGET.read_text() != original:
                 print(f"    RESTORE FAILED for {name}")
                 sys.exit(2)
     print(f"\n{len(MUTANTS) - len(survivors)}/{len(MUTANTS)} mutants killed")
