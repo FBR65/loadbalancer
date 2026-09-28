@@ -1,39 +1,13 @@
 # src/loadbalancer/config.py
 import json
+import logging
+import math
 import os
-import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-# CA bundle for upstream (vLLM) connections. The container (Dockerfile) sets
-# SSL_CERT_FILE to a merged bundle (system CAs + ITZBund); locally it falls back
-# to the repo's internal CA. Overridable via the SSL_CERT_FILE env var.
-_DEFAULT_CA_BUNDLE = Path(__file__).resolve().parents[2] / "certs" / "itzbund-ca.pem"
-SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", str(_DEFAULT_CA_BUNDLE))
-
-
-def upstream_ssl_context() -> ssl.SSLContext:
-    """SSL context for upstream (vLLM) connections.
-
-    System CA store plus the SSL_CERT_FILE bundle (e.g. the ITZBund internal CA),
-    layered on top so both public and internal certificates verify. The bundle
-    is *added* to the system store, never used instead of it, so a single
-    internal CA does not drop the public CAs. http backends are unaffected
-    (the context only applies to https).
-    """
-    # create_default_context() reads SSL_CERT_FILE and would use it as the sole
-    # store, losing the public CAs if the bundle is internal-only. Clear it
-    # temporarily so we start from the true system store, then layer on top.
-    saved = os.environ.pop("SSL_CERT_FILE", None)
-    try:
-        ctx = ssl.create_default_context()
-    finally:
-        if saved is not None:
-            os.environ["SSL_CERT_FILE"] = saved
-    bundle = Path(SSL_CERT_FILE)
-    if bundle.is_file():
-        ctx.load_verify_locations(bundle)
-    return ctx
+logger = logging.getLogger("loadbalancer.config")
 
 
 @dataclass
@@ -48,6 +22,70 @@ class Config:
     overload_threshold: int = 10
     kv_cache_overload_threshold: float = 0.95
     max_body_size: int = 64 * 1024**2
+
+
+# Accepted settings: json key -> (attribute, converter, inclusive min, inclusive max).
+# A value outside the range (or non-finite, or a bool) is rejected and the current
+# value is kept, so a typo can never disable the upstream timeout or the retry budget.
+_SETTINGS: dict[str, tuple[str, Any, float | None, float | None]] = {
+    "poll_interval": ("poll_interval", float, 0.1, None),
+    "timeout": ("timeout", float, 0.1, None),
+    "listen_port": ("listen_port", int, 1, 65535),
+    "queue_time_weight": ("queue_time_weight", float, 0.0, None),
+    "max_retries": ("max_retries", int, 0, None),
+    "retry_backoff": ("retry_backoff", float, 0.0, None),
+    "overload_threshold": ("overload_threshold", int, 0, None),
+    "kv_cache_overload_threshold": ("kv_cache_overload_threshold", float, 0.0, 1.0),
+    "max_body_size": ("max_body_size", int, 1, None),
+}
+
+
+def _coerce(attr: str, converter: Any, raw: object, lo: float | None, hi: float | None) -> Any:
+    """Convert `raw` and enforce the range, or return None when unacceptable.
+
+    Bools are rejected outright: `int(True) == 1` would silently rewrite a
+    numeric setting. Non-finite floats (`NaN`/`Infinity`, which `json.loads`
+    accepts) never pass the bound checks.
+    """
+    if isinstance(raw, bool):
+        logger.warning("ignoring %s: bool is not a valid number", attr)
+        return None
+    try:
+        value = converter(raw)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(value):
+        return None
+    if lo is not None and value < lo:
+        return None
+    if hi is not None and value > hi:
+        return None
+    return value
+
+
+def _apply_setting(config: Config, key: str, raw: object) -> None:
+    spec = _SETTINGS.get(key)
+    if spec is None:
+        return
+    attr, converter, lo, hi = spec
+    value = _coerce(attr, converter, raw, lo, hi)
+    if value is None:
+        logger.warning("ignoring invalid setting %s=%r", key, raw)
+        return
+    setattr(config, attr, value)
+
+
+def _env_number(
+    name: str, default: float, converter: Any, lo: float | None, hi: float | None
+) -> Any:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = _coerce(name, converter, raw, lo, hi)
+    if value is None:
+        logger.warning("ignoring invalid env %s=%r; using %r", name, raw, default)
+        return default
+    return value
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -73,48 +111,50 @@ def load_dotenv(path: Path | None = None) -> None:
         pass
 
 
+def _read_json(path: Path) -> dict[str, Any] | None:
+    """Parse a JSON object from `path`; None on any error (missing/broken/not an object)."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        logger.warning("cannot read %s: %s", path.name, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def reload_from_files(
     config: Config,
     settings_path: Path | None = None,
     models_path: Path | None = None,
     config_dir: Path | None = None,
 ) -> None:
+    """Apply operator-edited JSON files onto `config`.
+
+    Each file is handled independently: a broken settings file must not stop a
+    valid models file (and vice versa) from being applied.
+    """
     if config_dir is not None:
         if settings_path is None:
             settings_path = config_dir / "einstellung.json"
         if models_path is None:
             models_path = config_dir / "modelle.json"
-    if settings_path is not None and settings_path.is_file():
-        try:
-            data = json.loads(settings_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return
-        _SETTINGS_KEYS = {
-            "poll_interval": (float, "poll_interval"),
-            "timeout": (float, "timeout"),
-            "listen_port": (int, "listen_port"),
-            "queue_time_weight": (float, "queue_time_weight"),
-            "max_retries": (int, "max_retries"),
-            "retry_backoff": (float, "retry_backoff"),
-            "overload_threshold": (int, "overload_threshold"),
-            "kv_cache_overload_threshold": (float, "kv_cache_overload_threshold"),
-            "max_body_size": (int, "max_body_size"),
-        }
-        for json_key, (typ, attr) in _SETTINGS_KEYS.items():
-            if json_key in data:
-                try:
-                    setattr(config, attr, typ(data[json_key]))
-                except (ValueError, TypeError):
-                    pass
 
-    if models_path is not None and models_path.is_file():
-        try:
-            data = json.loads(models_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return
-        urls = data.get("vllm_urls")
-        if isinstance(urls, list) and all(isinstance(u, str) for u in urls):
-            config.vllm_urls = urls
+    if settings_path is not None:
+        data = _read_json(settings_path)
+        if data is not None:
+            for key in _SETTINGS:
+                if key in data:
+                    _apply_setting(config, key, data[key])
+
+    if models_path is not None:
+        data = _read_json(models_path)
+        if data is not None:
+            urls = data.get("vllm_urls")
+            if isinstance(urls, list) and all(isinstance(u, str) for u in urls):
+                config.vllm_urls = urls
+            else:
+                logger.warning("ignoring %s: vllm_urls must be a list of strings", models_path.name)
 
 
 def load_config(config_dir: Path | None = None) -> Config:
@@ -123,16 +163,12 @@ def load_config(config_dir: Path | None = None) -> Config:
             os.getenv("VLLM_1_URL", "http://vllm1:8000"),
             os.getenv("VLLM_2_URL", "http://vllm2:8000"),
         ],
-        poll_interval=float(os.getenv("POLL_INTERVAL", "2.0")),
-        timeout=float(os.getenv("TIMEOUT", "300.0")),
-        listen_port=int(os.getenv("LISTEN_PORT", "8000")),
-        queue_time_weight=float(os.getenv("QUEUE_TIME_WEIGHT", "1.0")),
-        max_retries=int(os.getenv("MAX_RETRIES", "2")),
-        retry_backoff=float(os.getenv("RETRY_BACKOFF", "0.2")),
-        overload_threshold=int(os.getenv("OVERLOAD_THRESHOLD", "10")),
-        kv_cache_overload_threshold=float(os.getenv("KV_CACHE_OVERLOAD_THRESHOLD", "0.95")),
-        max_body_size=int(os.getenv("MAX_BODY_SIZE", str(64 * 1024**2))),
     )
+    for key, (attr, converter, lo, hi) in _SETTINGS.items():
+        default = getattr(config, attr)
+        env_name = key.upper()
+        value = _env_number(env_name, default, converter, lo, hi)
+        setattr(config, attr, value)
     if config_dir is not None:
         reload_from_files(config, config_dir=config_dir)
     return config

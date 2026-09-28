@@ -1,10 +1,18 @@
 """SC-1: no retry once the response has been committed to the client."""
 
+import asyncio
+
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet, read_leniently
 
 from loadbalancer.config import Config
+
+# A regression that makes the proxy retry after the response was committed
+# leaves the client socket open forever (no second status line can be sent).
+# These tests bound the read so such a regression shows up as a fast, clean
+# assertion failure instead of a hung suite.
+READ_TIMEOUT = 5
 
 
 async def _half_streamed_then_dead(request: web.Request) -> web.StreamResponse:
@@ -35,7 +43,10 @@ async def test_stream_failure_does_not_retry_onto_another_instance(fleet: Fleet)
 
     async with TestClient(lb) as client:
         response = await client.post("/v1/chat/completions", json={"model": "m", "stream": True})
-        body = await read_leniently(response)
+        try:
+            body = await asyncio.wait_for(read_leniently(response), READ_TIMEOUT)
+        except TimeoutError:
+            body = b""
 
     assert fleet.hits["flaky"] == ["/v1/chat/completions"], "flaky instance must be tried once"
     assert fleet.hits["healthy"] == [], "no retry may hit another instance after a commit"

@@ -12,7 +12,6 @@ def score(running: float, waiting: float, queue_time_sum: float, weight: float =
 def pick(
     states: Mapping[str, MetricsState | None],
     weight: float = 1.0,
-    exclude: str | None = None,
     inflight: Mapping[str, int] | None = None,
     rng: random.Random | None = None,
 ) -> str | None:
@@ -28,8 +27,6 @@ def pick(
     best_score = None
     tied: list[str] = []
     for url, st in states.items():
-        if url == exclude:
-            continue
         if st is None:
             continue
         running = max(st["running"], inflight.get(url, 0))

@@ -33,6 +33,12 @@ growing counter and would bias the score over time).
 
 A new request goes to the instance with the lowest score. Instances that fail to report metrics are marked unhealthy and skipped.
 
+All instances are polled **concurrently** each cycle, so a single slow or
+unreachable backend never delays the others (serially, N unreachable instances
+would stretch one poll interval to N × timeout). When a URL disappears from
+`modelle.json` (hot reload) it is removed from the routing pool on the next
+poll.
+
 ### In-flight tracking and tie-breaking
 
 The `/metrics` gauges lag by up to one poll interval, so the balancer also
@@ -145,7 +151,6 @@ Environment variables (see `.env.example`):
 | `OVERLOAD_THRESHOLD` | `10` | Do not retry into an instance whose waiting queue is at/above this threshold |
 | `KV_CACHE_OVERLOAD_THRESHOLD` | `0.95` | Do not retry into an instance whose `kv_cache_usage_perc` is at/above this fraction (leading saturation signal; absolut `None` → signal ignored) |
 | `MAX_BODY_SIZE` | `67108864` | Max request body size in bytes (default 64 MiB); larger bodies are rejected with `413` (also `max_body_size` in `einstellung.json`) |
-| `SSL_CERT_FILE` | `certs/itzbund-ca.pem` | Extra CA bundle layered onto the system trust store for upstream TLS. The Docker image sets this to a merged bundle (system CAs + ITZBund internal CA) so internal backend certs verify while public ones still work. |
 
 ## Usage
 
@@ -167,7 +172,7 @@ docker run -p 8000:8000 --env-file .env vllm-lb
 
 ```bash
 uv sync
-uv run pytest -q                    # tests (33)
+uv run pytest -q                    # tests (83)
 uv run pytest -q --cov=src/loadbalancer  # coverage
 uv run ruff check .                 # lint
 uv run ruff format --check .        # format
@@ -199,7 +204,12 @@ scripts/
 - Repeated upstream headers (e.g. several `Set-Cookie`) collapse to the last
   one when relayed; vLLM does not use them.
 - Hot reload applies to routing/scoring settings; `listen_port` and
-  `max_body_size` are read at startup and need a restart.
+  `max_body_size` are read at startup and need a restart. Removing a URL from
+  `modelle.json` drops it from the routing pool on the next poll.
+- Settings files are validated: a value that is out of range, non-finite
+  (`NaN`/`Infinity`) or a bool is rejected (previous value kept, warning
+  logged). A malformed `einstellung.json` no longer prevents a valid
+  `modelle.json` from loading.
 - `GET /metrics` is proxied to a backend; the balancer exposes no metrics of
   its own, and `GET /health` reports `ok` even when every backend is down.
 

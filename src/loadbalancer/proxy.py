@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 
 from loadbalancer.balancer import pick
-from loadbalancer.config import Config, load_config, upstream_ssl_context
+from loadbalancer.config import Config, load_config
 
 logger = logging.getLogger("loadbalancer.proxy")
 
@@ -109,7 +109,6 @@ class Proxy:
         self.states = states  # url -> metrics dict or None
         # model id -> endpoints hosting that model (queried from /v1/models at startup)
         self.model_map = model_map if model_map is not None else {}
-        self.ssl_ctx = upstream_ssl_context()
         # locally in-flight requests per instance (see balancer.pick); the
         # upstream /metrics gauges lag by up to one poll interval
         self.inflight: dict[str, int] = {}
@@ -125,7 +124,7 @@ class Proxy:
         it when the app shuts down.
         """
         if self._session is None:
-            self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=self.ssl_ctx))
+            self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self) -> None:

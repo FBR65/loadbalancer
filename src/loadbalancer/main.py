@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from loadbalancer.config import Config, load_config, load_dotenv, upstream_ssl_context
+from loadbalancer.config import Config, load_config, load_dotenv
 from loadbalancer.metrics import MetricsResult, parse_metrics
 from loadbalancer.proxy import build_app
 from loadbalancer.watchdog import ConfigWatcher
@@ -35,6 +35,78 @@ def metrics_urls(base: str) -> list[str]:
     return urls
 
 
+async def _fetch_one(
+    session: aiohttp.ClientSession, url: str
+) -> tuple[MetricsResult | None, str | None]:
+    """(metrics, error) for one instance, trying its /metrics URL candidates.
+
+    Never raises: an unreachable instance yields (None, reason) so one bad
+    backend cannot abort the whole poll cycle.
+    """
+    last_error: str | None = None
+    for metrics_url in metrics_urls(url):
+        try:
+            async with session.get(metrics_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    return parse_metrics(await resp.text(), on_malformed=_log_malformed), None
+                last_error = f"status {resp.status} ({metrics_url})"
+        except (TimeoutError, aiohttp.ClientError, OSError) as exc:
+            last_error = f"{type(exc).__name__} ({metrics_url})"
+    return None, last_error
+
+
+def _compute_state(
+    url: str,
+    metrics: MetricsResult,
+    states: State,
+    prev: dict[str, tuple[float, int]],
+    prev_preemptions: dict[str, float],
+) -> dict[str, int | float | bool | None]:
+    """Derive this instance's load state from a metrics sample.
+
+    Counter-based values (queue time, preemptions) are turned into per-poll
+    *deltas* against the previous sample, so the score reflects recent load and
+    a counter reset (vLLM restart) yields 0 instead of a negative rate.
+    """
+    p = prev.get(url)
+    if p is not None and metrics["queue_time_count"] > p[1]:
+        if metrics["queue_time_sum"] < p[0]:
+            rate = 0.0  # counter reset (e.g. vLLM restart)
+        else:
+            rate = (metrics["queue_time_sum"] - p[0]) / (metrics["queue_time_count"] - p[1])
+    else:
+        rate = 0.0
+    prev[url] = (metrics["queue_time_sum"], metrics["queue_time_count"])
+
+    # Effective load: only capacity-waiting counts as a load signal;
+    # deferred waiters (LoRA/KV budget/blocked) are not real load.
+    reasons = metrics["waiting_by_reason"]
+    if reasons:
+        capacity = reasons.get("capacity", 0.0)
+        deferred = sum(v for k, v in reasons.items() if k != "capacity")
+    else:
+        capacity = metrics["waiting"]
+        deferred = 0.0
+
+    raw_preemptions = metrics["preemptions"]
+    baseline = prev_preemptions.get(url)
+    preemption_delta = 0.0
+    if baseline is not None and raw_preemptions >= baseline:
+        preemption_delta = raw_preemptions - baseline
+    prev_preemptions[url] = raw_preemptions
+
+    sleep_state = metrics["sleep_state"]
+    return {
+        "running": metrics["running"],
+        "waiting": capacity,
+        "waiting_deferred": deferred,
+        "queue_time_sum": rate,
+        "kv_cache_usage_perc": metrics["kv_cache_usage_perc"],
+        "preemptions": preemption_delta,
+        "sleeping": sleep_state is not None and sleep_state > 0,
+    }
+
+
 async def poll_metrics(
     config: Config,
     states: State,
@@ -50,67 +122,33 @@ async def poll_metrics(
     seen_urls = tuple(config.vllm_urls)
     while True:
         urls = tuple(config.vllm_urls)
-        if model_map is not None and urls != seen_urls:
+        if urls != seen_urls:
             seen_urls = urls
-            new_map = await fetch_model_map(config, session)
-            model_map.clear()
-            model_map.update(new_map)
-            logger.info("model map refreshed: %d model(s), %d endpoint(s)", len(new_map), len(urls))
-        for url in config.vllm_urls:
-            metrics: MetricsResult | None = None
-            last_error: str | None = None
-            for metrics_url in metrics_urls(url):
-                try:
-                    async with session.get(
-                        metrics_url, timeout=aiohttp.ClientTimeout(total=5)
-                    ) as resp:
-                        if resp.status == 200:
-                            metrics = parse_metrics(await resp.text(), on_malformed=_log_malformed)
-                            break
-                        last_error = f"status {resp.status} ({metrics_url})"
-                except (TimeoutError, aiohttp.ClientError, OSError) as exc:
-                    last_error = f"{type(exc).__name__} ({metrics_url})"
+            # Drop instances that left the fleet: `states` is the proxy's
+            # routing pool, so a stale key would keep routing to a removed
+            # backend forever.
+            for gone in set(states) - set(urls):
+                del states[gone]
+                prev.pop(gone, None)
+                prev_preemptions.pop(gone, None)
+                logger.info("instance removed: %s", gone)
+            if model_map is not None:
+                new_map = await fetch_model_map(config, session)
+                model_map.clear()
+                model_map.update(new_map)
+                logger.info(
+                    "model map refreshed: %d model(s), %d endpoint(s)", len(new_map), len(urls)
+                )
+        # All instances are polled concurrently: a slow backend must not delay
+        # the others (serially, 9 unreachable instances would stretch one
+        # 2s poll cycle to 45s). State computation stays sequential below, on
+        # this single event-loop thread, because the counter baselines are
+        # order-dependent.
+        fetched = await asyncio.gather(*(_fetch_one(session, url) for url in urls))
+        for url, (metrics, last_error) in zip(urls, fetched):
             state: dict[str, int | float | bool | None] | None = None
             if metrics is not None:
-                p = prev.get(url)
-                if p is not None and metrics["queue_time_count"] > p[1]:
-                    if metrics["queue_time_sum"] < p[0]:
-                        rate = 0.0  # counter reset (e.g. vLLM restart)
-                    else:
-                        rate = (metrics["queue_time_sum"] - p[0]) / (
-                            metrics["queue_time_count"] - p[1]
-                        )
-                else:
-                    rate = 0.0
-                prev[url] = (metrics["queue_time_sum"], metrics["queue_time_count"])
-
-                # Effective load: only capacity-waiting counts as a load signal;
-                # deferred waiters (LoRA/KV budget/blocked) are not real load.
-                reasons = metrics["waiting_by_reason"]
-                if reasons:
-                    capacity = reasons.get("capacity", 0.0)
-                    deferred = sum(v for k, v in reasons.items() if k != "capacity")
-                else:
-                    capacity = metrics["waiting"]
-                    deferred = 0.0
-
-                raw_preemptions = metrics["preemptions"]
-                baseline = prev_preemptions.get(url)
-                preemption_delta = 0.0
-                if baseline is not None and raw_preemptions >= baseline:
-                    preemption_delta = raw_preemptions - baseline
-                prev_preemptions[url] = raw_preemptions
-
-                sleep_state = metrics["sleep_state"]
-                state = {
-                    "running": metrics["running"],
-                    "waiting": capacity,
-                    "waiting_deferred": deferred,
-                    "queue_time_sum": rate,
-                    "kv_cache_usage_perc": metrics["kv_cache_usage_perc"],
-                    "preemptions": preemption_delta,
-                    "sleeping": sleep_state is not None and sleep_state > 0,
-                }
+                state = _compute_state(url, metrics, states, prev, prev_preemptions)
             if state is None and states.get(url) is not None:
                 logger.warning("instance unhealthy: %s (%s)", url, last_error)
                 prev.pop(url, None)
@@ -172,8 +210,7 @@ async def main() -> None:
     model_map_path: str | None = None
     watcher = ConfigWatcher(config, config_dir)
     watcher.start()
-    ssl_ctx = upstream_ssl_context()
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx)) as session:
+    async with aiohttp.ClientSession() as session:
         model_map = await fetch_model_map(config, session)
         if model_map:
             model_map_path = write_model_map(model_map)

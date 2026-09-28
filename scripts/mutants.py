@@ -8,6 +8,8 @@ file is restored from git, so the restore is verifiable with `git diff`.
     uv run python scripts/mutants.py
 
 Exit code 0 = all mutants killed. Any survivor is a hole in the gauntlet.
+A suite that *hangs* counts as killed too (a timeout is an observable failure),
+but it is reported distinctly so a hanging test can be fixed separately.
 """
 
 import subprocess
@@ -16,8 +18,13 @@ from pathlib import Path
 
 TARGET = Path("src/loadbalancer/proxy.py")
 
+# The clean suite finishes in ~1s. A mutant can make it block forever (e.g. a
+# retry into an already-committed response), which would otherwise hang this
+# whole script instead of reporting a result.
+SUITE_TIMEOUT = 120
+
 SESSION_PROP = """        if self._session is None:
-            self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=self.ssl_ctx))
+            self._session = aiohttp.ClientSession()
         return self._session"""
 
 MUTANTS: list[tuple[str, str, str]] = [
@@ -44,7 +51,7 @@ MUTANTS: list[tuple[str, str, str]] = [
     (
         "K4: a fresh ClientSession per access (no pooling, no cleanup)",
         SESSION_PROP,
-        "        return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=self.ssl_ctx))",
+        "        return aiohttp.ClientSession()",
     ),
     (
         "K4: /v1/models backends queried serially",
@@ -59,8 +66,14 @@ MUTANTS: list[tuple[str, str, str]] = [
 ]
 
 
-def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+def run(cmd: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run the suite; None means it exceeded SUITE_TIMEOUT (a hang)."""
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=SUITE_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def main() -> int:
@@ -78,12 +91,18 @@ def main() -> int:
             result = run(
                 ["uv", "run", "pytest", "-q", "-x", "--no-header", "-p", "no:cacheprovider"]
             )
-            killed = result.returncode != 0
-            first = next(
-                (ln for ln in result.stdout.splitlines() if ln.startswith("FAILED")),
-                "no FAILED line",
-            )
-            print(f"  {'KILLED  ' if killed else 'SURVIVED'}  {name}")
+            if result is None:
+                killed = True
+                first = f"suite hung (timeout {SUITE_TIMEOUT}s) -> counted as killed"
+                label = "HUNG/KILLED"
+            else:
+                killed = result.returncode != 0
+                first = next(
+                    (ln for ln in result.stdout.splitlines() if ln.startswith("FAILED")),
+                    "no FAILED line",
+                )
+                label = "KILLED  " if killed else "SURVIVED"
+            print(f"  {label}  {name}")
             print(f"            {first}")
             if not killed:
                 survivors.append(name)
