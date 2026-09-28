@@ -1,0 +1,13 @@
+{
+"vllm_urls": [
+  "https://gpt-oss-120b.net",
+  "https://gpt-oss-120b1.net",
+  "https://gpt-oss-120b2.net",
+  "https://paddle.net",
+  "https://paddle1.net",
+  "https://paddle2.net",
+  "https://dots.net",
+  "https://dots1.net",
+  "https://dots2.net"
+]
+}
