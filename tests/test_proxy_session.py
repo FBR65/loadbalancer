@@ -98,3 +98,22 @@ async def test_list_models_503_when_every_backend_fails(fleet: Fleet) -> None:
 
     assert response.status == 503
     assert b"no models available" in body
+
+
+async def test_list_models_survives_a_backend_answering_garbage(fleet: Fleet) -> None:
+    async def broken(request: web.Request) -> web.StreamResponse:
+        return web.Response(text="not json", content_type="application/json")
+
+    async def ok(request: web.Request) -> web.StreamResponse:
+        return web.json_response({"object": "list", "data": [{"id": "good"}]})
+
+    await fleet.backend("broken", broken)
+    await fleet.backend("ok", ok)
+    lb = await fleet.start_lb(["broken", "ok"])
+
+    async with TestClient(lb) as client:
+        response = await client.get("/v1/models")
+        data = await response.json()
+
+    assert response.status == 200
+    assert [m["id"] for m in data["data"]] == ["good"]

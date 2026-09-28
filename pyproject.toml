@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-loadbalancer = "vllm_lb.main:main"
+loadbalancer = "vllm_lb.main:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

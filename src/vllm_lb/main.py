@@ -197,5 +197,10 @@ async def main() -> None:
             logger.info("model map removed: %s", model_map_path)
 
 
+def run() -> None:
+    """Console-script entry point; `main` is a coroutine and cannot be one."""
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     asyncio.run(main())
