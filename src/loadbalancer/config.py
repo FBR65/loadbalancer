@@ -22,6 +22,7 @@ class Config:
     overload_threshold: int = 10
     kv_cache_overload_threshold: float = 0.95
     max_body_size: int = 64 * 1024**2
+    auth_token: str = ""
 
 
 # Accepted settings: json key -> (attribute, converter, inclusive min, inclusive max).
@@ -37,6 +38,7 @@ _SETTINGS: dict[str, tuple[str, Any, float | None, float | None]] = {
     "overload_threshold": ("overload_threshold", int, 0, None),
     "kv_cache_overload_threshold": ("kv_cache_overload_threshold", float, 0.0, 1.0),
     "max_body_size": ("max_body_size", int, 1, None),
+    "auth_token": ("auth_token", str, None, None),
 }
 
 
@@ -47,6 +49,11 @@ def _coerce(attr: str, converter: Any, raw: object, lo: float | None, hi: float 
     numeric setting. Non-finite floats (`NaN`/`Infinity`, which `json.loads`
     accepts) never pass the bound checks.
     """
+    if converter is str:
+        if not isinstance(raw, str):
+            logger.warning("ignoring %s: must be a string", attr)
+            return None
+        return raw
     if isinstance(raw, bool):
         logger.warning("ignoring %s: bool is not a valid number", attr)
         return None
@@ -73,6 +80,11 @@ def _apply_setting(config: Config, key: str, raw: object) -> None:
         logger.warning("ignoring invalid setting %s=%r", key, raw)
         return
     setattr(config, attr, value)
+
+
+def _env_text(name: str, default: str) -> str:
+    """A non-numeric setting, read verbatim (an auth token must not be coerced)."""
+    return os.getenv(name, default) or ""
 
 
 def _env_number(
@@ -164,7 +176,10 @@ def load_config(config_dir: Path | None = None) -> Config:
             os.getenv("VLLM_2_URL", "http://vllm2:8000"),
         ],
     )
+    config.auth_token = _env_text("AUTH_TOKEN", config.auth_token)
     for key, (attr, converter, lo, hi) in _SETTINGS.items():
+        if converter is str:
+            continue  # already read above; the numeric reader cannot handle text
         default = getattr(config, attr)
         env_name = key.upper()
         value = _env_number(env_name, default, converter, lo, hi)

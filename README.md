@@ -62,10 +62,14 @@ The balancer answers these itself:
 | Endpoint | Behaviour |
 |---|---|
 | `GET /` | Service banner and the list of proxied endpoints |
-| `GET /health` | Liveness — reports `ok` even when every backend is down (see [Known limits](#known-limits)) |
+| `GET /health` | Liveness — `ok` whenever the process is alive, even with every backend down. Used by the container `HEALTHCHECK` |
+| `GET /ready` | Readiness — `503` while no backend reports metrics, so a balancer with nothing to serve is taken out of rotation |
+| `GET /metrics` | The balancer's **own** Prometheus counters (no longer relayed upstream) |
 | `GET /v1/models` | Live aggregate of `/v1/models` from all backends; `503` if none answers |
 
 Every other path and method is forwarded. `/v1/chat/completions`, `/v1/completions`, `/v1/responses` (incl. `/{id}` and `/{id}/cancel`), tool calling, and streaming (SSE) therefore work unchanged; transient `500/502/503/504` responses fall back to another endpoint of the same group.
+
+`/health`, `/ready` and `/metrics` are the balancer's own and are never proxied; `/v1/models` aggregates the backends live.
 
 ## Retry behavior
 
@@ -75,7 +79,9 @@ On transient errors the balancer retries before giving up:
 2. **Bounded retries** — `MAX_RETRIES` (default 2) retries *after* the first attempt, i.e. up to 3 upstream requests, with `RETRY_BACKOFF` (default 0.2s) between them.
 3. **Prefer a fresh endpoint** — on retry, the balancer prefers one that has not been tried yet for this request, falling back to an already-tried (or the same) endpoint only if no fresh healthy one exists.
 4. **No retry storm** — an endpoint whose waiting queue is at/above `OVERLOAD_THRESHOLD`, or whose KV-cache usage is at/above `KV_CACHE_OVERLOAD_THRESHOLD`, is not retried into.
-5. **Never after a commit** — once any byte of the response has reached the client, there is no retry. A second attempt could only append a different answer to a half-delivered body and would pay for the inference twice, so the client keeps its (possibly truncated) stream instead.
+5. **Never after a commit** — once any byte of the response has reached the client, there is no retry. A second attempt could only append a different answer to a half-delivered body and would pay for the inference twice.
+
+A stream that breaks mid-body is therefore **reported, never silently truncated**: an SSE client receives a terminal `event: error` naming the failure, and the body is left incomplete, so a raw client cannot mistake a cut-off answer for a finished one. A stream that completes normally is closed cleanly and is distinguishable from a broken one.
 
 If all retries are exhausted, the balancer returns `504` naming the failing endpoint.
 
@@ -102,7 +108,8 @@ Configuration comes from two sources. **Environment variables provide the defaul
 | `RETRY_BACKOFF` | `0.2` | Delay between retries, in seconds |
 | `OVERLOAD_THRESHOLD` | `10` | Do not retry into an endpoint whose waiting queue is at/above this |
 | `KV_CACHE_OVERLOAD_THRESHOLD` | `0.95` | Do not retry into an endpoint whose `kv_cache_usage_perc` is at/above this fraction; an absent value means the signal is ignored |
-| `MAX_BODY_SIZE` | `67108864` | Max request body in bytes (64 MiB); larger bodies get `413` (startup only) |
+| `MAX_BODY_SIZE` | `67108864` | Max request body in bytes (64 MiB); larger bodies get `413`. Enforced per request, so it hot-reloads |
+| `AUTH_TOKEN` | *(empty)* | When set, clients must present this token (see [Authentication](#authentication)); empty means open |
 
 ### `modelle.json` — the fleet
 
@@ -128,7 +135,23 @@ Keys mirror the environment variables above, in lower case:
 
 Both files are hot-reloaded on change. Values are **validated**: anything out of range, non-finite (`NaN` / `Infinity`, which `json.loads` otherwise accepts) or a `bool` is rejected — the previous value is kept and a warning is logged. The two files are read independently, so a broken `einstellung.json` no longer prevents a valid `modelle.json` from loading.
 
-`listen_port` and `max_body_size` are read once at startup; changing them needs a restart.
+**Every** setting is hot-reloadable, including `listen_port` and `max_body_size`. Two details matter:
+
+- Deleting a key does **not** reset it — the previous value is kept. Set `"auth_token": ""` to switch authentication off again.
+- `listen_port` is moved by binding the new port **before** closing the old listener, so a typo or a port that is already taken logs an error and leaves the balancer running. Requests in flight on the old port are dropped, exactly as on a restart.
+
+## Authentication
+
+Set `auth_token` (or `AUTH_TOKEN`) to require a token. Everything except the operational endpoints then answers `401` without one:
+
+| Header | Meaning |
+|---|---|
+| `X-Auth-Token: <token>` | The balancer's own credential. **Stripped before forwarding**, so it never reaches a backend |
+| `Authorization: Bearer <token>` | Relayed to the backend unchanged — that is the backend's own credential slot (the OpenAI key) and doubles as balancer auth |
+
+Tokens are compared with `hmac.compare_digest`, so a wrong token cannot be recovered character by character from response timing. `/`, `/health`, `/ready` and `/metrics` stay open: probes must keep working while the balancer is unhealthy, and none of them reveals backend data.
+
+**Without a token the balancer is open**, and it says so in a warning at startup. Anything that can reach the port can use the backends, so put it behind your reverse proxy or configure a token.
 
 ## Usage
 
@@ -140,17 +163,29 @@ uv run python -m loadbalancer.main   # equivalent
 
 The balancer reads `.env` from the working directory on startup (existing variables always win) and then applies `CONFIG_DIR`.
 
+### Container
+
+```bash
+docker build -t loadbalancer .
+docker run --rm -p 8000:8000 \
+  -v "$PWD/config:/app/config:ro" \
+  -e AUTH_TOKEN=... \
+  loadbalancer
+```
+
+The image pins `python:3.12-slim`, installs `ca-certificates` for HTTPS to backends (the custom CA bundle is gone), runs as the unprivileged `balancer` user (uid 10001) and declares a `HEALTHCHECK` against `/health` — liveness, not `/ready`, because restarting the container cannot repair a dead backend and a readiness probe would restart-loop. The config directory is mounted read-only; hot reload then applies to the mounted files.
+
 ## Development
 
 ```bash
 uv sync
-uv run pytest -q                       # 83 tests
-uv run pytest -q --cov=loadbalancer    # coverage (88 %)
+uv run pytest -q                       # 122 tests
+uv run pytest -q --cov=loadbalancer    # coverage
 uv run ruff check .                    # lint
 uv run ruff format --check .           # format
 uv run mypy src tests scripts          # strict type check
-uv run python scripts/mutants.py       # mutation testing (7 mutants, all must die)
-uv run python scripts/smoke.py         # boots the real console script against real backends
+uv run python scripts/mutants.py       # mutation testing (16 mutants, all must die)
+uv run python scripts/smoke.py         # boots the real console script against real backends (14 checks)
 ```
 
 The proxy tests drive real aiohttp servers over real sockets, so keep-alive, streaming and mid-stream disconnects are exercised rather than mocked; the scoring, config and parser layers are covered by fast unit and property tests.
@@ -162,10 +197,12 @@ src/loadbalancer/
 ├── config.py        # configuration: env defaults, JSON files, validation
 ├── metrics.py       # /metrics parser (Prometheus format)
 ├── balancer.py      # load score + instance selection
-├── proxy.py         # async reverse proxy + streaming
+├── proxy.py         # async reverse proxy + streaming + auth
+├── telemetry.py     # the balancer's own Prometheus counters
 ├── watchdog.py      # hot reload of einstellung.json / modelle.json
-└── main.py          # metrics polling + server startup
+└── main.py          # metrics polling + server startup + port rebinding
 config/              # einstellung.json, modelle.json (hot-reloaded)
+Dockerfile           # container image (non-root, HEALTHCHECK)
 scripts/
 ├── mutants.py       # manual mutation testing
 └── smoke.py         # real-execution smoke test
@@ -174,12 +211,13 @@ tests/               # unit, integration (real sockets), property tests
 
 ## Known limits
 
-- A response that breaks **after** the proxy already wrote bytes to the client (mid-SSE disconnect) is not retried — the client keeps a truncated stream rather than a second, spliced-in answer from another endpoint.
-- Repeated upstream headers (e.g. several `Set-Cookie`) collapse to the last one when relayed; vLLM does not use them.
-- The balancer does not authenticate. Anything that can reach port 8000 can use the backends — it is meant to sit behind the existing reverse proxy.
-- Hot reload applies to routing and scoring settings; `listen_port` and `max_body_size` need a restart.
-- `GET /metrics` is proxied to a backend; the balancer exposes no metrics of its own, and `GET /health` reports `ok` even when every backend is down.
-- No container image is built from this repository; deployment is up to the surrounding infrastructure.
+- A broken stream is **reported, not repaired**. After bytes have reached the client there is no retry — a second attempt would splice a different answer onto a half-written body and pay for the inference twice. SSE clients get a terminal `event: error`; the bytes already sent stay incomplete, so the partial answer has to be discarded by the client.
+- `listen_port` is changed by re-binding the socket, which drops requests in flight on the old port. A config value the process cannot bind is refused (the old listener keeps serving), but a *successfully* bound wrong port still takes traffic away.
+- `X-Auth-Token` is stripped before forwarding, but `Authorization` is relayed — if the balancer token and the backend key are different, send the balancer token via `X-Auth-Token` only.
+- Request bodies are buffered in memory to enforce `max_body_size` (64 MiB by default). There is no streaming upload path.
+- Readiness reflects "a backend reported metrics", not "a backend can serve this model"; a model whose endpoints are all unhealthy still yields `503` only once the model is requested.
+- The healthcheck probes liveness, so a balancer with every backend down stays `healthy` in Docker. Use `/ready` for load-balancer or orchestration readiness.
+- `GET /metrics` used to be relayed to a backend; it now serves the balancer's own counters. Upstream metrics remain available on each backend's own URL.
 
 ## License
 

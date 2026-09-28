@@ -4,7 +4,7 @@ import asyncio
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient
-from conftest import Fleet, read_leniently
+from conftest import Fleet, read_leniently, read_outcome
 
 from loadbalancer.config import Config
 
@@ -65,6 +65,51 @@ async def test_truncated_stream_reaches_the_client_as_truncated(fleet: Fleet) ->
 
     assert b"served_by" not in body
     assert body in (b"", b'data: {"tok": 1}\n\n')
+
+
+async def test_broken_stream_is_signalled_to_the_client_not_silently_truncated(
+    fleet: Fleet,
+) -> None:
+    """A cut-off stream must be distinguishable from a normally finished one.
+
+    Silence is the real defect: a client that reads a clean end of body cannot
+    tell "the model finished" from "the backend died halfway" and will happily
+    return a half answer as a complete one.
+    """
+    await fleet.backend("flaky", _half_streamed_then_dead)
+    lb = await fleet.start_lb(["flaky"], states=fleet.states(flaky={"queue_time_sum": 0.0}))
+
+    async with TestClient(lb) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "m", "stream": True})
+        try:
+            body, error = await asyncio.wait_for(read_outcome(response), READ_TIMEOUT)
+        except TimeoutError:
+            body, error = b"", TimeoutError()
+
+    signalled = error is not None or b"event: error" in body
+    assert signalled, "a broken stream must be observable by the client"
+    assert b"data: [DONE]" not in body, "a cut-off stream must not look complete"
+
+
+async def test_broken_sse_stream_ends_with_a_terminal_error_event(fleet: Fleet) -> None:
+    """An SSE client must learn *what* failed, not just that the body ended.
+
+    A raw client sees only an incomplete body. An SDK-based client parses the
+    event stream, so the failure has to be a terminal `error` event to be
+    actionable rather than an opaque transport error.
+    """
+    await fleet.backend("flaky", _half_streamed_then_dead)
+    lb = await fleet.start_lb(["flaky"], states=fleet.states(flaky={"queue_time_sum": 0.0}))
+
+    async with TestClient(lb) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "m", "stream": True})
+        try:
+            body, _ = await asyncio.wait_for(read_outcome(response), READ_TIMEOUT)
+        except TimeoutError:
+            body = b""
+
+    assert b"event: error" in body, f"no terminal error event in {body!r}"
+    assert b"upstream" in body.lower(), "the error event must name the failure"
 
 
 async def test_retryable_status_before_commit_is_still_retried(fleet: Fleet) -> None:

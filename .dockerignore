@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+.coverage
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+*.md
+!README.md
+Dockerfile
+.dockerignore

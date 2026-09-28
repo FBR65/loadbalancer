@@ -1,15 +1,19 @@
 # src/loadbalancer/proxy.py
 import asyncio
+import contextlib
+import hmac
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import cast
 
 import aiohttp
 from aiohttp import web
+from multidict import CIMultiDict
 
 from loadbalancer.balancer import pick
 from loadbalancer.config import Config, load_config
+from loadbalancer.telemetry import Telemetry
 
 logger = logging.getLogger("loadbalancer.proxy")
 
@@ -36,14 +40,69 @@ HOP_BY_HOP = frozenset(
 # length would describe bytes that are no longer on the wire.
 ENTITY_HEADERS = frozenset({"content-encoding", "content-length"})
 
+# Absolute ceiling on a buffered request body, independent of `max_body_size`,
+# so a single pathological request cannot exhaust memory. The configured limit
+# (which may change at runtime) is enforced in Proxy._read_body.
+HARD_BODY_CEILING = 1 << 30  # 1 GiB
 
-def _forwardable_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    """Response headers that may be relayed to the client unchanged."""
-    return {
-        key: value
+# Operational endpoints stay reachable without a token: a liveness or
+# readiness probe has to work while the balancer is being restarted, and none
+# of them reveals backend data.
+UNPROTECTED = frozenset({"/", "/health", "/ready", "/metrics"})
+
+# The balancer's own credential. It is stripped before forwarding, so it never
+# reaches a backend. `Authorization` is deliberately *not* listed: that is the
+# backend's credential slot (the OpenAI key) and is relayed unchanged.
+LB_TOKEN_HEADER = "X-Auth-Token"
+
+
+def _presented_token(request: web.Request) -> str | None:
+    """The token the client presents, from either accepted header."""
+    dedicated = request.headers.get(LB_TOKEN_HEADER)
+    if dedicated:
+        return dedicated.strip()
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return None
+
+
+@web.middleware
+async def require_token(
+    request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
+) -> web.StreamResponse:
+    """Reject unauthenticated traffic when `auth_token` is configured.
+
+    The comparison is constant-time so a wrong token cannot be recovered one
+    character at a time from response timing.
+    """
+    config = request.app[CONFIG_KEY]
+    token = config.auth_token
+    if not token or request.path in UNPROTECTED:
+        return await handler(request)
+    presented = _presented_token(request)
+    if presented is None or not hmac.compare_digest(presented, token):
+        logger.warning("rejected unauthenticated request to %s", request.path)
+        return web.json_response(
+            {"error": {"type": "unauthorized", "message": "missing or invalid token"}},
+            status=401,
+        )
+    return await handler(request)
+
+
+def _forwardable_headers(headers: Mapping[str, str]) -> CIMultiDict[str]:
+    """Response headers that may be relayed to the client unchanged.
+
+    A `CIMultiDict` preserves repeated header names (several `Set-Cookie`, for
+    example). A plain dict keyed by name keeps only the last value, so a
+    client would silently receive a partial set.
+    """
+    return CIMultiDict(
+        (key, value)
         for key, value in headers.items()
         if key.lower() not in HOP_BY_HOP and key.lower() not in ENTITY_HEADERS
-    }
+    )
 
 
 def _is_stream(resp: aiohttp.ClientResponse, request: web.Request, wants_stream: bool) -> bool:
@@ -112,6 +171,7 @@ class Proxy:
         # locally in-flight requests per instance (see balancer.pick); the
         # upstream /metrics gauges lag by up to one poll interval
         self.inflight: dict[str, int] = {}
+        self.telemetry = Telemetry()
         self._session: aiohttp.ClientSession | None = None
 
     @property
@@ -168,13 +228,41 @@ class Proxy:
             return aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=self.config.timeout)
         return aiohttp.ClientTimeout(total=self.config.timeout)
 
+    async def _read_body(self, request: web.Request) -> bytes:
+        """The request body, rejecting anything over the *current* limit.
+
+        The limit is read per request so a hot reload takes effect without a
+        restart. `client_max_size` is only a hard memory backstop (a config
+        value may be raised above it), and Content-Length is client-supplied,
+        so the bytes are counted as they arrive rather than trusted.
+        """
+        limit = self.config.max_body_size
+        declared = request.content_length
+        if declared is not None and declared > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=declared)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await request.content.readany()
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > limit:
+                raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=total)
+            chunks.append(chunk)
+
     async def _forward(self, request: web.Request, path: str) -> web.StreamResponse:
-        body = await request.read()
+        body = await self._read_body(request)
         model, wants_stream = _body_fields(body)
-        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        headers = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in ("host", LB_TOKEN_HEADER.lower())
+        }
         timeout = self._upstream_timeout(wants_stream)
         tried: list[str] = []
         last_error: str | None = None
+        self.telemetry.requests_total += 1
 
         for attempt in range(self.config.max_retries + 1):
             # Rule 3: on retry, prefer an instance that has not been tried
@@ -218,6 +306,7 @@ class Proxy:
                         # the connection can return to the pool.
                         await resp.read()
                         tried.append(target)
+                        self.telemetry.retries_total += 1
                         last_error = f"status {resp.status} ({target})"
                         await asyncio.sleep(self.config.retry_backoff)
                         continue
@@ -242,9 +331,11 @@ class Proxy:
                 # Rule 1: connection error / timeout is transient, retry
                 if attempt < self.config.max_retries:
                     tried.append(target)
+                    self.telemetry.retries_total += 1
                     last_error = f"{type(exc).__name__} ({target})"
                     await asyncio.sleep(self.config.retry_backoff)
                     continue
+                self.telemetry.upstream_errors_total += 1
                 logger.warning("upstream error: %s: %s (%s)", type(exc).__name__, exc, target)
                 return web.Response(
                     status=504, text=f"upstream error: {type(exc).__name__} ({target})"
@@ -264,18 +355,49 @@ class Proxy:
         self,
         resp: aiohttp.ClientResponse,
         request: web.Request,
-        headers: dict[str, str],
+        headers: CIMultiDict[str],
     ) -> web.StreamResponse:
-        """Relay a response body chunk by chunk (SSE); never retried afterwards."""
+        """Relay a response body chunk by chunk (SSE).
+
+        A stream that breaks mid-body is never retried (the client already
+        holds part of this answer, and a second attempt would splice a
+        different answer onto a half-written body and pay for the inference
+        twice). The break is instead made explicit: SSE clients get a terminal
+        `error` event, and the body is never ended cleanly, so a raw client
+        cannot mistake a truncated answer for a finished one.
+        """
         response = web.StreamResponse(status=resp.status, headers=headers)
         await response.prepare(request)
-        async for chunk in resp.content.iter_any():
-            await response.write(chunk)
+        is_sse = "text/event-stream" in headers.get("content-type", "")
+        try:
+            async for chunk in resp.content.iter_any():
+                await response.write(chunk)
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            self.telemetry.stream_errors_total += 1
+            logger.warning("stream broke mid-response: %s: %s", type(exc).__name__, exc)
+            if is_sse:
+                # Best effort: the client may already be gone, and losing the
+                # event then costs nothing because the body stays incomplete.
+                with contextlib.suppress(aiohttp.ClientError, OSError, RuntimeError):
+                    await response.write(
+                        b"event: error\ndata: "
+                        + json.dumps(
+                            {
+                                "error": {
+                                    "type": "upstream_stream_error",
+                                    "message": f"upstream stream broke mid-response: {exc!s}",
+                                }
+                            }
+                        ).encode()
+                        + b"\n\n"
+                    )
+            raise
         await response.write_eof()
         return response
 
 
 PROXY_KEY: web.AppKey[Proxy] = web.AppKey("proxy", Proxy)
+CONFIG_KEY: web.AppKey[Config] = web.AppKey("config", Config)
 
 
 async def _fetch_models(
@@ -306,8 +428,15 @@ def build_app(
     if states is None:
         states = {url: None for url in config.vllm_urls}
     p = Proxy(config, states, model_map)
-    app = web.Application(client_max_size=config.max_body_size)
+    # Only a memory backstop: the real, hot-reloadable limit is enforced per
+    # request in Proxy._read_body, so a config value may be raised above this.
+    app = web.Application(client_max_size=HARD_BODY_CEILING, middlewares=[require_token])
     app[PROXY_KEY] = p
+    app[CONFIG_KEY] = config
+    if not config.auth_token:
+        logger.warning(
+            "AUTH_TOKEN is not set: every client that can reach this port may use the backends"
+        )
 
     async def upstream_session(_app: web.Application) -> AsyncIterator[None]:
         try:
@@ -320,6 +449,29 @@ def build_app(
     async def health(_request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def ready(_request: web.Request) -> web.Response:
+        """Readiness: usable only while at least one backend reports metrics.
+
+        Separate from /health on purpose. /health answers "is this process
+        alive", which is what a liveness probe needs and stays true during a
+        backend outage; a readiness probe has to fail so the balancer is taken
+        out of rotation instead of accepting traffic it cannot serve.
+        """
+        healthy = sum(1 for state in states.values() if state is not None)
+        status = 200 if healthy else 503
+        return web.json_response(
+            {"status": "ready" if healthy else "not ready", "healthy_backends": healthy},
+            status=status,
+        )
+
+    async def metrics(_request: web.Request) -> web.Response:
+        # The version parameter is part of the Prometheus text exposition
+        # contract; `web.Response(content_type=...)` cannot express it.
+        return web.Response(
+            body=p.telemetry.render(states, p.inflight).encode(),
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+        )
+
     async def root(_request: web.Request) -> web.Response:
         return web.json_response(
             {
@@ -327,12 +479,13 @@ def build_app(
                 "api": "vLLM OpenAI-compatible API (proxied to the least-loaded instance)",
                 "endpoints": [
                     "GET /health",
+                    "GET /ready",
                     "GET /v1/models",
                     "POST /v1/chat/completions",
                     "POST /v1/completions",
                     "POST /v1/responses",
                     "POST /v1/responses/{id}/cancel",
-                    "GET /metrics",
+                    "GET /metrics (the balancer's own counters)",
                 ],
             }
         )
@@ -366,6 +519,8 @@ def build_app(
 
     app.router.add_get("/", root)
     app.router.add_get("/health", health)
+    app.router.add_get("/ready", ready)
+    app.router.add_get("/metrics", metrics)
     app.router.add_get("/v1/models", list_models)
     # Generischer Catch-all: leitet jeden Pfad (chat/completions, responses, tool calling) weiter
     app.router.add_route("*", "/{path:.*}", catchall)

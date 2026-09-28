@@ -98,4 +98,28 @@ async def read_leniently(response: ClientResponse) -> bytes:
         return b""
 
 
-__all__ = ["ClientResponse", "Fleet", "Handler", "read_leniently", "state"]
+async def read_outcome(response: ClientResponse) -> tuple[bytes, Exception | None]:
+    """`(bytes received, error)` so a test can tell a cut-off stream from a
+    clean end of body. `read_leniently` hides that difference.
+
+    Reads chunk by chunk and keeps what arrived before the break — `read()`
+    discards the partial body, which is exactly the part under test.
+    """
+    chunks: list[bytes] = []
+    error: Exception | None = None
+    try:
+        async for chunk in response.content.iter_any():
+            chunks.append(chunk)
+    except Exception as exc:  # noqa: BLE001 - the error is the assertion subject
+        error = exc
+    return b"".join(chunks), error
+
+
+__all__ = [
+    "ClientResponse",
+    "Fleet",
+    "Handler",
+    "read_leniently",
+    "read_outcome",
+    "state",
+]

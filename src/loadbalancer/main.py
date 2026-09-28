@@ -194,6 +194,37 @@ def write_model_map(mapping: dict[str, list[str]]) -> str:
     return path
 
 
+async def rebind_port(runner: web.AppRunner, current: web.TCPSite, wanted: int) -> web.TCPSite:
+    """Move the listener to `wanted`, keeping the old one until it works.
+
+    The new socket is bound *before* the old one is closed: a config typo (a
+    privileged port, a port already in use) must not take the balancer down.
+    Requests already in flight on the old port are dropped, which is the same
+    consequence a restart would have.
+    """
+    site = web.TCPSite(runner, "0.0.0.0", wanted)
+    try:
+        await site.start()
+    except OSError as exc:
+        logger.error("cannot listen on port %s (%s); keeping the current port", wanted, exc)
+        return current
+    await current.stop()
+    logger.info("now listening on port %s", wanted)
+    return site
+
+
+async def follow_listen_port(runner: web.AppRunner, config: Config, site: web.TCPSite) -> None:
+    """Rebind whenever `listen_port` changes in the config files."""
+    current = site
+    port = config.listen_port
+    while True:
+        await asyncio.sleep(1.0)
+        if config.listen_port == port:
+            continue
+        current = await rebind_port(runner, current, config.listen_port)
+        port = config.listen_port
+
+
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(
@@ -226,6 +257,7 @@ async def main() -> None:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", config.listen_port)
         await site.start()
+        asyncio.create_task(follow_listen_port(runner, config, site))
         await stop.wait()
         watcher.stop()
         await runner.cleanup()

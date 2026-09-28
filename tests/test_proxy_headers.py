@@ -5,6 +5,7 @@ import gzip
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 from conftest import Fleet
+from multidict import CIMultiDict
 
 from loadbalancer.proxy import HOP_BY_HOP, _forwardable_headers
 
@@ -71,6 +72,42 @@ async def test_streamed_response_is_framed_as_chunked(fleet: Fleet) -> None:
     assert body == b"data: 1\n\ndata: [DONE]\n\n"
     assert "content-length" not in response.headers, "a stream has no known length"
     assert response.headers.get("transfer-encoding") == "chunked"
+
+
+async def test_repeated_response_headers_reach_the_client_intact(fleet: Fleet) -> None:
+    """A repeated header (several Set-Cookie) must survive relaying.
+
+    A plain dict keyed by header name would keep only the last value and
+    silently drop the others, so the client would end up with a partial
+    session.
+    """
+
+    async def cookies(request: web.Request) -> web.StreamResponse:
+        response = web.Response(body=b'{"ok": true}', headers={"content-type": "application/json"})
+        response.headers.add("Set-Cookie", "a=1; Path=/")
+        response.headers.add("Set-Cookie", "b=2; Path=/")
+        return response
+
+    await fleet.backend("a", cookies)
+    lb = await fleet.start_lb(["a"], states=fleet.states(a={}))
+
+    async with TestClient(lb) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "m"})
+        await response.read()
+
+    assert response.headers.getall("Set-Cookie") == ["a=1; Path=/", "b=2; Path=/"]
+
+
+def test_forwardable_headers_keeps_repeated_header_names() -> None:
+    given = CIMultiDict(
+        [("Set-Cookie", "a=1"), ("Set-Cookie", "b=2"), ("X-Keep", "1"), ("Connection", "close")]
+    )
+
+    kept = _forwardable_headers(given)
+
+    assert kept.getall("Set-Cookie") == ["a=1", "b=2"]
+    assert kept.getall("X-Keep") == ["1"]
+    assert "Connection" not in kept
 
 
 def test_forwardable_headers_drops_every_hop_by_hop_and_entity_header() -> None:
